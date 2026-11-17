@@ -1,0 +1,103 @@
+@'
+import re
+import time
+import serial
+
+PORT = "COM7"
+BAUD = 115200
+SECONDS_PER_CHANNEL = 8
+CHANNELS = range(11, 27)
+
+def command(port, text, settle=0.25):
+    port.write((text + "\r\n").encode("ascii"))
+    port.flush()
+    time.sleep(settle)
+
+def drain(port):
+    port.reset_input_buffer()
+
+print("ESP32-H2 IEEE 802.15.4 Channel Scanner")
+print(f"Port: {PORT}, baud: {BAUD}")
+print(f"Window: {SECONDS_PER_CHANNEL}s per channel")
+print()
+
+ser = serial.Serial()
+ser.port = PORT
+ser.baudrate = BAUD
+ser.timeout = 0.2
+ser.dtr = False
+ser.rts = False
+
+results = []
+
+try:
+    ser.open()
+    command(ser, "")
+    command(ser, "shell echo off")
+
+    for channel in CHANNELS:
+        command(ser, "sniffer stop")
+        command(ser, f"sniffer channel {channel}")
+        drain(ser)
+        command(ser, "sniffer start")
+
+        total = 0
+        ack = 0
+        rssi = []
+        deadline = time.monotonic() + SECONDS_PER_CHANNEL
+
+        while time.monotonic() < deadline:
+            line = ser.readline().decode("ascii", errors="replace")
+            match = re.search(
+                r"psdu:\s*([0-9a-fA-F]+)\s+power:\s*(-?\d+)",
+                line
+            )
+
+            if not match:
+                continue
+
+            frame = bytes.fromhex(match.group(1))
+            if len(frame) < 3:
+                continue
+
+            total += 1
+            rssi.append(int(match.group(2)))
+
+            # IEEE 802.15.4 Frame Control: bits 0..2
+            frame_type = frame[0] & 0x07
+            if frame_type == 2:
+                ack += 1
+
+        data_frames = total - ack
+        avg_rssi = round(sum(rssi) / len(rssi), 1) if rssi else None
+        results.append((channel, total, data_frames, ack, avg_rssi))
+
+        signal = f"{avg_rssi} dBm" if avg_rssi is not None else "-"
+        print(
+            f"CH {channel:2d}: "
+            f"frames={total:4d} "
+            f"non_ack={data_frames:4d} "
+            f"ack={ack:4d} "
+            f"avg_rssi={signal}",
+            flush=True
+        )
+
+finally:
+    if ser.is_open:
+        try:
+            command(ser, "sniffer stop")
+            command(ser, "sniffer channel 11")
+            command(ser, "sniffer start")
+        finally:
+            ser.close()
+
+print()
+print("===== CHANNEL SUMMARY =====")
+for channel, total, data, ack, rssi in sorted(
+    results, key=lambda item: item[1], reverse=True
+):
+    print(f"Channel {channel:2d}: {total:4d} frames")
+
+print()
+print("Scan completed. Radio restored to channel 11.")
+'@ | python -
